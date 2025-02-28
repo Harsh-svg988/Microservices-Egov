@@ -1,0 +1,176 @@
+package digit.service;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+
+import digit.config.WaterConnectionConfiguration;
+import digit.util.UserUtil;
+import digit.web.models.OwnerInfo;
+import digit.web.models.WaterConnection;
+import digit.web.models.WaterConnectionCreateRequest;
+
+import org.springframework.util.CollectionUtils;
+
+import lombok.extern.slf4j.Slf4j;
+import org.apache.commons.lang.StringUtils;
+import org.egov.common.contract.request.RequestInfo;
+import org.egov.common.contract.request.User;
+import org.egov.common.contract.user.CreateUserRequest;
+import org.egov.common.contract.user.UserDetailResponse;
+import org.egov.common.contract.user.UserSearchRequest;
+import org.egov.tracer.model.CustomException;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Service;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+
+@Service
+@Slf4j
+public class UserService {
+
+    private UserUtil userUtils;
+    private WaterConnectionConfiguration config;
+
+    private ObjectMapper objectMapper;
+
+    @Autowired
+    public UserService(UserUtil userUtils, WaterConnectionConfiguration config, ObjectMapper objectMapper) {
+        this.userUtils = userUtils;
+        this.config = config;
+        this.objectMapper = objectMapper;
+    }
+
+    public void callUserService(WaterConnectionCreateRequest request) {
+        WaterConnection connection = request.getWaterConnection();
+
+        connection.getConnectionHolders().forEach(holder -> {
+            if (!StringUtils.isEmpty(holder.getUuid())) {
+                enrichUser(holder, request.getRequestInfo(), connection.getTenantId());
+            } else {
+                User user = createConnectionHolderUser(holder, connection.getTenantId());
+                holder.setUuid(upsertUser(user, request.getRequestInfo()).getUuid());
+            }
+        });
+    }
+
+    private User createConnectionHolderUser(OwnerInfo holder, String tenantId) {
+        return User.builder()
+                .userName(holder.getName().toLowerCase().replaceAll(" ", "_"))
+                .name(holder.getName())
+                .mobileNumber(holder.getMobileNumber())
+                .emailId(holder.getEmailId())
+                .tenantId(tenantId)
+                .type("CITIZEN")
+                .build();
+    }
+
+    private void enrichUser(OwnerInfo holder, RequestInfo requestInfo, String tenantId) {
+        UserDetailResponse userDetailResponse = searchUser(userUtils.getStateLevelTenant(tenantId), holder.getUuid(),
+                null);
+
+        if (CollectionUtils.isEmpty(userDetailResponse.getUser())) {
+            throw new CustomException("INVALID_ACCOUNTID", "No user exists for the given UUID: " + holder.getUuid());
+        }
+
+        User userFromSearch = userDetailResponse.getUser().get(0);
+        holder.setName(userFromSearch.getName());
+        holder.setMobileNumber(userFromSearch.getMobileNumber());
+        holder.setEmailId(userFromSearch.getEmailId());
+    }
+
+    private User upsertUser(User user, RequestInfo requestInfo) {
+        String tenantId = user.getTenantId();
+        User userServiceResponse;
+
+        UserDetailResponse userDetailResponse = searchUser(userUtils.getStateLevelTenant(tenantId), null,
+                user.getUserName());
+        if (!userDetailResponse.getUser().isEmpty()) {
+            User userFromSearch = userDetailResponse.getUser().get(0);
+            log.info("User found: {}", userFromSearch);
+
+            if (!user.getUserName().equalsIgnoreCase(userFromSearch.getUserName())) {
+                userServiceResponse = updateUser(requestInfo, user, userFromSearch);
+            } else {
+                userServiceResponse = userFromSearch;
+            }
+        } else {
+            userServiceResponse = createUser(requestInfo, tenantId, user);
+        }
+
+        return userServiceResponse;
+    }
+
+    private User createUser(RequestInfo requestInfo, String tenantId, User userInfo) {
+        userUtils.addUserDefaultFields(userInfo.getMobileNumber(), tenantId, userInfo);
+        StringBuilder uri = new StringBuilder(config.getUserHost())
+                .append(config.getUserContextPath())
+                .append(config.getUserCreateEndpoint());
+
+        CreateUserRequest user = new CreateUserRequest(requestInfo, userInfo);
+        log.info("Creating user: {}", user.getUser());
+        UserDetailResponse userDetailResponse = userUtils.userCall(user, uri);
+        return userDetailResponse.getUser().get(0);
+    }
+
+    private User updateUser(RequestInfo requestInfo, User user, User userFromSearch) {
+        userFromSearch.setName(user.getName());
+
+        StringBuilder uri = new StringBuilder(config.getUserHost())
+                .append(config.getUserContextPath())
+                .append(config.getUserUpdateEndpoint());
+
+        UserDetailResponse userDetailResponse = userUtils.userCall(new CreateUserRequest(requestInfo, userFromSearch),
+                uri);
+        return userDetailResponse.getUser().get(0);
+    }
+
+    public UserDetailResponse searchUser(String stateLevelTenant, String accountId, String userName) {
+        UserSearchRequest userSearchRequest = new UserSearchRequest();
+        userSearchRequest.setActive(false);
+        userSearchRequest.setTenantId(stateLevelTenant);
+
+        if (StringUtils.isEmpty(accountId) && StringUtils.isEmpty(userName)) {
+            return null;
+        }
+
+        if (!StringUtils.isEmpty(accountId)) {
+            userSearchRequest.setUuid(Collections.singletonList(accountId));
+        }
+
+        if (!StringUtils.isEmpty(userName)) {
+            userSearchRequest.setUserName(userName);
+        }
+
+        StringBuilder uri = new StringBuilder(config.getUserHost()).append(config.getUserSearchEndpoint());
+        try {
+            String requestJson = objectMapper.writeValueAsString(userSearchRequest);
+            System.out.println("User Request: " + requestJson);
+
+        } catch (Exception e) {
+            throw new CustomException("ABC", "here");
+        }
+        return userUtils.userCall(userSearchRequest, uri);
+    }
+
+    private Map<String, User> searchBulkUser(List<String> uuids) {
+        UserSearchRequest userSearchRequest = new UserSearchRequest();
+        userSearchRequest.setActive(false);
+        // userSearchRequest.setUserType("CITIZEN");
+
+        if (!CollectionUtils.isEmpty(uuids)) {
+            userSearchRequest.setUuid(uuids);
+        }
+
+        StringBuilder uri = new StringBuilder(config.getUserHost()).append(config.getUserSearchEndpoint());
+        UserDetailResponse userDetailResponse = userUtils.userCall(userSearchRequest, uri);
+        List<User> users = userDetailResponse.getUser();
+
+        if (CollectionUtils.isEmpty(users)) {
+            throw new CustomException("USER_NOT_FOUND", "No user found for the uuids");
+        }
+
+        return users.stream().collect(Collectors.toMap(User::getUuid, Function.identity()));
+    }
+}
